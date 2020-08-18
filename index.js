@@ -1,5 +1,6 @@
 const neo4j = require('neo4j-driver');
 const axios = require('axios');
+const { uniqBy, flatten } = require('lodash');
 
 const driver = neo4j.driver(
   'neo4j://localhost',
@@ -7,48 +8,67 @@ const driver = neo4j.driver(
 );
 
 const instance = axios.create({
-  baseURL: 'https://www.dnd5eapi.co/api/',
+  baseURL: 'https://www.dnd5eapi.co',
 });
 
 async function ingestClasses() {
   const session = await driver.session();
-  const response = await instance.get('classes');
+  const response = await instance.get('api/classes');
   const classesRefs = response.data.results;
   const classes = await Promise.all(
-    classesRefs.map((ref) =>
-      instance.get(`classes/${ref.index}`).then((res) => res.data)
-    )
+    classesRefs.map((ref) => instance.get(ref.url).then((res) => res.data))
   );
+
+  // console.log(JSON.stringify(classes[0], null, 2));
 
   await session.run(
     `
-  FOREACH (class in $classes |
-    MERGE (c:Class { index: class.index })
-    SET c = {
-      name: class.name,
-      hit_die: class.hit_die,
-      url: class.url
-    }
-    FOREACH (prof in class.proficiencies |
-      MERGE (ec:\`Equipment Category\` { url: prof.url  })
-      SET ec.name = prof.name
-      MERGE (c) - [:IS_PROFICIENT_WITH] -> (ec)
-    )
-  )
+    UNWIND $classes as class
+    UNWIND class.proficiencies as prof
+    MERGE (c:Class { url: class.url })
+    SET c.name = class.name, c.hit_die = class.hit_die
+    MERGE (p:Proficiency { url: prof.url })
+    SET p.name = prof.name
+    MERGE (c)-[:IS_PROFICIENT_WITH]->(p)
   `,
     {
       classes,
     }
   );
 
+  // Get proficiencies
+
+  const proficienciesRefs = uniqBy(
+    flatten(classes.map((c) => c.proficiencies)),
+    'url'
+  );
+
+  const proficiencies = await Promise.all(
+    proficienciesRefs.map(({ url }) =>
+      instance.get(url).then((res) => res.data)
+    )
+  );
+
+  // console.log(JSON.stringify(proficiencies.slice(0, 2), null, 2));
+
+  await session.run(
+    `
+    UNWIND $proficiencies as prof
+    UNWIND prof.references as ref
+    MATCH (p:Proficiency {url: prof.url})
+    MERGE (p) - [r:REFERENCES] -> (rr:Reference { url: ref.url })
+    SET p.name=prof.name, p.type=prof.type, rr=ref
+  `,
+    { proficiencies }
+  );
   // equipment categories
 
-  const equipmentCategories = (await instance.get('/equipment-categories')).data
-    .results;
+  const equipmentCategories = (await instance.get('api/equipment-categories'))
+    .data.results;
   const expanded = (
     await Promise.all(
       equipmentCategories.map((ec) =>
-        instance.get(`equipment-categories/${ec.index}`).then((res) => res.data)
+        instance.get(ec.url).then((res) => res.data)
       )
     )
   ).filter((ec) => !!ec.url);
